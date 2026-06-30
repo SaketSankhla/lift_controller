@@ -1,113 +1,230 @@
 // lift_controller.v
-// Condensed 4-Floor Elevator Controller (FPGA-Generic)
-// Student Project | B.Tech ECE
+// Simple 4-Floor Elevator Controller (Textbook Style)
+// Student Lab Project | B.Tech ECE (7th Sem)
 
 module lift_controller #(
-    parameter CLK_FREQ_HZ = 50_000_000
+    parameter CLK_FREQ_HZ = 50_000_000  // Default board clock frequency
 )(
-    input  wire       clk, rst, door_obstruction, cabin_overload,
-    input  wire [3:0] hall_req_up, hall_req_dn, cabin_req, floor_sensor,
-    output reg        motor_up, motor_dn, brake_release, door_open, door_close
+    input  wire       clk,
+    input  wire       rst,
+    
+    // Inputs from buttons
+    input  wire [3:0] hall_req_up,      // UP requests from floors 0, 1, 2, 3
+    input  wire [3:0] hall_req_dn,      // DOWN requests from floors 0, 1, 2, 3
+    input  wire [3:0] cabin_req,        // Destination calls inside the cabin
+    
+    // Inputs from sensors
+    input  wire [3:0] floor_sensor,     // One-hot sensor input (e.g. 4'b0010 = Floor 1)
+    input  wire       door_obstruction, // 1 if door is blocked
+    input  wire       cabin_overload,   // 1 if cabin is overloaded
+    
+    // Actuator outputs
+    output reg        motor_up,         // Turn motor on to go UP
+    output reg        motor_dn,         // Turn motor on to go DOWN
+    output reg        brake_release,    // Release mechanical brake (active high)
+    output reg        door_open,        // Command door to open
+    output reg        door_close        // Command door to close
 );
-    // States
-    localparam IDLE = 2'b00, MOVE = 2'b01, OPEN = 2'b10;
+
+    // FSM States
+    parameter IDLE = 2'b00;
+    parameter UP   = 2'b01;
+    parameter DN   = 2'b10;
+    parameter OPEN = 2'b11;
     
     reg [1:0]  state;
-    reg [1:0]  curr, target;
-    reg        dir; // 1 = UP, 0 = DOWN
-    reg [3:0]  reqs;
+    reg [1:0]  next_state;
+    
+    // Floor tracking registers
+    reg [1:0]  curr_floor;
+    reg [1:0]  target_floor;
+    reg        direction; // 1 = UP, 0 = DOWN
+    
+    // Call latch registers
+    reg [3:0]  req_up;
+    reg [3:0]  req_dn;
+    reg [3:0]  req_cab;
+    
+    // Combined calls
+    wire [3:0] all_req = req_up | req_dn | req_cab;
+    wire       any_req = |all_req;
+    
+    // Dwell timer register (3 seconds)
+    localparam DWELL_COUNT = 3 * CLK_FREQ_HZ;
     reg [27:0] timer;
 
-    // Decode current floor position
-    always @(posedge clk) begin
-        if (floor_sensor[0])      curr <= 2'd0;
-        else if (floor_sensor[1]) curr <= 2'd1;
-        else if (floor_sensor[2]) curr <= 2'd2;
-        else if (floor_sensor[3]) curr <= 2'd3;
-    end
-
-    // Latch button requests and clear serviced floor requests
+    // 1. Position decoder (One-Hot to Binary conversion)
     always @(posedge clk) begin
         if (rst) begin
-            reqs <= 4'b0000;
+            curr_floor <= 2'b00;
         end else begin
-            reqs <= (reqs | hall_req_up | hall_req_dn | cabin_req);
+            if (floor_sensor[0])      curr_floor <= 2'd0;
+            else if (floor_sensor[1]) curr_floor <= 2'd1;
+            else if (floor_sensor[2]) curr_floor <= 2'd2;
+            else if (floor_sensor[3]) curr_floor <= 2'd3;
+        end
+    end
+
+    // 2. Request latching and clears
+    always @(posedge clk) begin
+        if (rst) begin
+            req_up  <= 4'b0000;
+            req_dn  <= 4'b0000;
+            req_cab <= 4'b0000;
+        end else begin
+            // Latch button clicks
+            req_up  <= req_up | hall_req_up;
+            req_dn  <= req_dn | hall_req_dn;
+            req_cab <= req_cab | cabin_req;
+            
+            // Clear current floor requests when doors are open
             if (state == OPEN) begin
-                reqs[curr] <= 1'b0;
+                req_up[curr_floor]  <= 1'b0;
+                req_dn[curr_floor]  <= 1'b0;
+                req_cab[curr_floor] <= 1'b0;
             end
         end
     end
 
-    // LOOK Algorithm: Check pending requests above and below
-    wire req_above = (curr == 0 && (reqs[1] || reqs[2] || reqs[3])) ||
-                     (curr == 1 && (reqs[2] || reqs[3])) ||
-                     (curr == 2 && reqs[3]);
-                     
-    wire req_below = (curr == 3 && (reqs[2] || reqs[1] || reqs[0])) ||
-                     (curr == 2 && (reqs[1] || reqs[0])) ||
-                     (curr == 1 && reqs[0]);
-
-    // FSM State Register & Controller Logic
-    always @(posedge clk) begin
-        if (rst) begin
-            state  <= IDLE;
-            target <= 2'b00;
-            dir    <= 1'b1; // Default: UP
-            timer  <= 28'd0;
+    // 3. Combinational target determination for LOOK scheduler
+    reg [1:0] target_comb;
+    always @(*) begin
+        target_comb = target_floor; // Default
+        if (all_req[curr_floor]) begin
+            target_comb = curr_floor;
         end else begin
-            case (state)
-                IDLE: begin
-                    if (reqs != 4'b0000 && !cabin_overload) begin
-                        if (reqs[curr]) begin
-                            state <= OPEN;
-                            timer <= 3 * CLK_FREQ_HZ; // Load 3-second timer for same floor request
-                        end else begin
-                            state <= MOVE;
-                            // Set target floor based on LOOK logic
-                            if (dir && req_above)
-                                target <= reqs[3] ? 2'd3 : (reqs[2] ? 2'd2 : 2'd1);
-                            else if (!dir && req_below)
-                                target <= reqs[0] ? 2'd0 : (reqs[1] ? 2'd1 : 2'd2);
-                            else begin
-                                dir    <= ~dir; // Change direction
-                                target <= (~dir) ? (reqs[3] ? 2'd3 : (reqs[2] ? 2'd2 : 2'd1))
-                                                 : (reqs[0] ? 2'd0 : (reqs[1] ? 2'd1 : 2'd2));
-                            end
-                        end
-                    end
-                end
-
-                MOVE: begin
-                    if (cabin_overload) begin
-                        state <= IDLE;
-                    end else if (floor_sensor[target]) begin
-                        state <= OPEN;
-                        timer <= 3 * CLK_FREQ_HZ; // Load 3-second timer
-                    end
-                end
-
-                OPEN: begin
-                    if (door_obstruction) begin
-                        timer <= 3 * CLK_FREQ_HZ; // Reset timer if door blocked
-                    end else if (timer > 28'd0) begin
-                        timer <= timer - 28'd1;
-                    end else begin
-                        state <= IDLE;
-                    end
+            case (curr_floor)
+                2'd0: begin
+                    if (all_req[1])      target_comb = 2'd1;
+                    else if (all_req[2]) target_comb = 2'd2;
+                    else if (all_req[3]) target_comb = 2'd3;
                 end
                 
-                default: state <= IDLE;
+                2'd1: begin
+                    if (direction == 1'b1) begin
+                        if (all_req[2])      target_comb = 2'd2;
+                        else if (all_req[3]) target_comb = 2'd3;
+                        else if (all_req[0]) target_comb = 2'd0;
+                    end else begin
+                        if (all_req[0])      target_comb = 2'd0;
+                        else if (all_req[2]) target_comb = 2'd2;
+                        else if (all_req[3]) target_comb = 2'd3;
+                    end
+                end
+
+                2'd2: begin
+                    if (direction == 1'b1) begin
+                        if (all_req[3])      target_comb = 2'd3;
+                        else if (all_req[1]) target_comb = 2'd1;
+                        else if (all_req[0]) target_comb = 2'd0;
+                    end else begin
+                        if (all_req[1])      target_comb = 2'd1;
+                        else if (all_req[0])      target_comb = 2'd0;
+                        else if (all_req[3]) target_comb = 2'd3;
+                    end
+                end
+
+                2'd3: begin
+                    if (all_req[2])      target_comb = 2'd2;
+                    else if (all_req[1]) target_comb = 2'd1;
+                    else if (all_req[0]) target_comb = 2'd0;
+                end
             endcase
         end
     end
 
-    // Moore Output Decoders
+    // 4. Sequential target and direction update
+    always @(posedge clk) begin
+        if (rst) begin
+            target_floor <= 2'b00;
+            direction    <= 1'b1; // Default to UP
+        end else if (state == IDLE || state == OPEN) begin
+            target_floor <= target_comb;
+            // Update direction flag
+            if (curr_floor == 2'd0) direction <= 1'b1;
+            else if (curr_floor == 2'd3) direction <= 1'b0;
+            else if (target_comb > curr_floor) direction <= 1'b1;
+            else if (target_comb < curr_floor) direction <= 1'b0;
+        end
+    end
+
+    // 5. Door hold timer control
+    always @(posedge clk) begin
+        if (rst) begin
+            timer <= 28'd0;
+        end else if (state == IDLE && any_req && all_req[curr_floor]) begin
+            timer <= DWELL_COUNT; // Load timer on same-floor request
+        end else if (state == UP || state == DN) begin
+            if (floor_sensor[target_floor]) begin
+                timer <= DWELL_COUNT; // Load timer upon arrival
+            end
+        end else if (state == OPEN) begin
+            if (door_obstruction) begin
+                timer <= DWELL_COUNT; // Reload timer if door is blocked
+            end else if (timer > 28'd0) begin
+                timer <= timer - 28'd1;
+            end
+        end
+    end
+
+    // 6. FSM Sequential state register
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= IDLE;
+        end else begin
+            state <= next_state;
+        end
+    end
+
+    // 7. FSM Combinational next-state decoder
     always @(*) begin
-        motor_up      = (state == MOVE) && (target > curr);
-        motor_dn      = (state == MOVE) && (target < curr);
-        brake_release = (state == MOVE);
+        next_state = state;
+        
+        case (state)
+            IDLE: begin
+                if (any_req && !cabin_overload) begin
+                    if (target_comb == curr_floor)
+                        next_state = OPEN;
+                    else if (target_comb > curr_floor)
+                        next_state = UP;
+                    else
+                        next_state = DN;
+                end
+            end
+            
+            UP: begin
+                if (cabin_overload) begin
+                    next_state = IDLE;
+                end else if (floor_sensor[target_floor]) begin
+                    next_state = OPEN;
+                end
+            end
+            
+            DN: begin
+                if (cabin_overload) begin
+                    next_state = IDLE;
+                end else if (floor_sensor[target_floor]) begin
+                    next_state = OPEN;
+                end
+            end
+            
+            OPEN: begin
+                if (timer == 28'd0 && !door_obstruction && !cabin_overload) begin
+                    next_state = IDLE;
+                end
+            end
+            
+            default: next_state = IDLE;
+        endcase
+    end
+
+    // 8. Moore Outputs Combinational Decoder
+    always @(*) begin
+        motor_up      = (state == UP);
+        motor_dn      = (state == DN);
+        brake_release = (state == UP || state == DN);
         door_open     = (state == OPEN);
-        door_close    = (state == IDLE || state == MOVE);
+        door_close    = (state == IDLE || state == UP || state == DN);
     end
 
 endmodule
