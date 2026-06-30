@@ -3,6 +3,7 @@
 /lift_controller.sim/
 /lift_controller.hw/
 /lift_controller.ip_user_files/
+/lift_controller.cache/
 /*.jou
 /*.log
 /xsim.dir/
@@ -12,3 +13,4 @@
 lift_sim
 dbg_sim
 tc2_sim
+
