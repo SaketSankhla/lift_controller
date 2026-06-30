@@ -1,0 +1,14 @@
+# Vivado temporary directories and files
+/lift_controller.runs/
+/lift_controller.sim/
+/lift_controller.hw/
+/lift_controller.ip_user_files/
+/*.jou
+/*.log
+/xsim.dir/
+
+# Simulator outputs
+*.vcd
+lift_sim
+dbg_sim
+tc2_sim
